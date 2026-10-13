@@ -7,17 +7,18 @@ Production-ready **document parsing, text normalization, and structure-aware chu
 ## Architecture
 
 ```mermaid
-flowchart LR
-  raw["Raw Document\n(PDF, DOCX, XLSX, Notion)"] --> source["SourceItem\n(Pydantic v2)"]
-  source --> router_p["ParserRouter\n(MIME detection)"]
-  router_p --> parser["Format Parser\n(PDF, DOCX, XLSX, Notion)"]
-  parser --> extracted["ExtractedDocument\n(Structured AST elements)"]
-  extracted --> normalizer["NormalizationService\n(Cleaner + SHA256 Hash)"]
-  normalizer --> norm_doc["NormalizedDocument\n(Cleaned TextSections)"]
-  norm_doc --> router_c["ChunkingRouter\n(Format routing)"]
-  router_c --> chunker["Structure Chunker\n(Breadcrumbs + Hierarchy)"]
-  chunker --> chunks["DocumentChunkSchema\n(Vector & Citation Ready)"]
+graph LR
+    A["Raw Document<br/>(PDF, DOCX, XLSX, Notion)"] --> B["SourceItem<br/>(Pydantic v2)"]
+    B --> C["ParserRouter<br/>(MIME detection)"]
+    C --> D["Format Parser<br/>(PDF, DOCX, XLSX, Notion)"]
+    D --> E["ExtractedDocument<br/>(Structured AST elements)"]
+    E --> F["NormalizationService<br/>(Cleaner + SHA256 Hash)"]
+    F --> G["NormalizedDocument<br/>(Cleaned TextSections)"]
+    G --> H["ChunkingRouter<br/>(Format routing)"]
+    H --> I["Structure Chunker<br/>(Breadcrumbs + Hierarchy)"]
+    I --> J["DocumentChunkSchema<br/>(Vector & Citation Ready)"]
 ```
+
 
 | Layer | Folder | Responsibility |
 |---|---|---|
@@ -240,11 +241,12 @@ Each chunk output contains rich citation metadata ready for vector databases (`p
 ## Example Entities
 
 ```mermaid
-flowchart TD
-  SourceItem --> ExtractedDocument
-  ExtractedDocument --> NormalizedDocument
-  NormalizedDocument --> DocumentChunkSchema
+graph TD
+    A["SourceItem"] --> B["ExtractedDocument"]
+    B --> C["NormalizedDocument"]
+    C --> D["DocumentChunkSchema"]
 ```
+
 
 All models inherit from **Pydantic v2 `BaseModel`** with full type annotations.
 
