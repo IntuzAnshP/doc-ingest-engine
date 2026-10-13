@@ -1,0 +1,186 @@
+import fitz  # PyMuPDF
+import re
+from collections import Counter
+from doc_ingest.parsers.base import BaseParser
+from doc_ingest.schemas.source_item import SourceItem
+from doc_ingest.schemas.extracted_document import ExtractedDocument, DocumentMetadata
+from doc_ingest.schemas.document_elements import HeadingElement, ParagraphElement, ListItemElement
+
+# Only match true bullets (symbols)
+BULLET_PATTERN = re.compile(r'^[\u2022\u2023\u25E6\u2043\u2219\-\*\u25ba\u25aa]')
+
+# Matches: "1. Intro", "1.1 Background", "1.2.1 Detailed Scope", all-caps headings, "Chapter N", "SECTION N"
+STRICT_HEADING_REGEX = re.compile(
+    r'^(?:\d+(?:\.\d+)*\.?\s+[A-Za-z][^\n]*|Chapter\s+\d+|SECTION\s+\d+|[A-Z][A-Z\s]{3,})$'
+)
+
+class PDFParser(BaseParser):
+    def supports(self, content_type: str) -> bool:
+        return content_type == "pdf"
+
+    def parse(self, source_item: SourceItem) -> ExtractedDocument:
+        doc = fitz.open(source_item.raw_path)
+        
+        full_text_blocks = []
+        elements = []
+        element_index = 0
+        current_section_path = []
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            
+            # Use "dict" to get span-level font sizes
+            page_dict = page.get_text("dict")
+            blocks = page_dict.get("blocks", [])
+            
+            # Find the most common font size on this page to serve as "body" font size
+            font_sizes = []
+            for b in blocks:
+                if b.get("type") == 0:  # text block
+                    for line in b.get("lines", []):
+                        for span in line.get("spans", []):
+                            text = span.get("text", "").strip()
+                            if text:
+                                font_sizes.append(round(span.get("size", 10.0), 1))
+                                
+            if font_sizes:
+                most_common_size = Counter(font_sizes).most_common(1)[0][0]
+            else:
+                most_common_size = 11.0  # fallback
+                
+            for b in blocks:
+                if b.get("type") != 0:  # skip image blocks
+                    continue
+                    
+                block_text = ""
+                max_font_size = 0.0
+                
+                lines_text = []
+                for line in b.get("lines", []):
+                    line_str = ""
+                    for span in line.get("spans", []):
+                        span_text = span.get("text", "")
+                        line_str += span_text
+                        size = span.get("size", 10.0)
+                        if size > max_font_size and span_text.strip():
+                            max_font_size = size
+                            
+                    lines_text.append(line_str.strip())
+                    
+                if not lines_text:
+                    continue
+                    
+                # Re-flow paragraph: join lines softly
+                reflowed_lines = []
+                for i, line in enumerate(lines_text):
+                    if not line:
+                        continue
+                    if i < len(lines_text) - 1 and not line[-1] in ".!?:,;-":
+                        reflowed_lines.append(line + " ")
+                    else:
+                        reflowed_lines.append(line + "\n")
+                        
+                block_text = "".join(reflowed_lines).strip()
+                
+                if not block_text:
+                    continue
+                
+                full_text_blocks.append(block_text)
+                
+                is_heading = False
+                heading_level = 1
+
+                first_line_of_block = block_text.split('\n')[0].strip()
+                is_bullet = bool(BULLET_PATTERN.match(first_line_of_block))
+                
+                # 1. Regex-based heading detection (Highest precision for structure)
+                if len(block_text) < 120 and STRICT_HEADING_REGEX.match(first_line_of_block):
+                    is_heading = True
+                    if first_line_of_block.startswith('Chapter') or first_line_of_block.startswith('SECTION') or first_line_of_block.isupper():
+                        heading_level = 1
+                    else:
+                        prefix = first_line_of_block.split()[0]
+                        num_parts = len([p for p in prefix.split('.') if p.isdigit()])
+                        heading_level = min(num_parts, 4) if num_parts > 0 else 1
+                
+                # 2. Size-based heading detection (Fallback for unnumbered headings)
+                elif not is_bullet and max_font_size >= most_common_size + 1.5:
+                    is_heading = True
+                    size_diff = max_font_size - most_common_size
+                    if size_diff > 8:
+                        heading_level = 1
+                    elif size_diff > 4:
+                        heading_level = 2
+                    else:
+                        heading_level = 3
+                        
+                # 3. Numbered List detection (only if not a heading)
+                if not is_heading and not is_bullet:
+                    numbered_list_pattern = re.compile(r'^\d+[\.)]\s+\S')
+                    if numbered_list_pattern.match(first_line_of_block):
+                        is_bullet = True
+
+                if is_heading:
+                    first_line = block_text.split("\n")[0][:100]
+                    current_section_path = current_section_path[:heading_level - 1]
+                    current_section_path.append(first_line)
+                    
+                    elements.append(HeadingElement(
+                        index=element_index,
+                        text=block_text,
+                        level=heading_level,
+                        section_path=list(current_section_path),
+                        page_number=page_num + 1
+                    ))
+                elif is_bullet:
+                    elements.append(ListItemElement(
+                        index=element_index,
+                        text=block_text,
+                        list_type="bullet",
+                        level=1,
+                        section_path=list(current_section_path),
+                        page_number=page_num + 1
+                    ))
+                else:
+                    elements.append(ParagraphElement(
+                        index=element_index,
+                        text=block_text,
+                        style="Normal",
+                        heading_level=None,
+                        section_path=list(current_section_path),
+                        page_number=page_num + 1
+                    ))
+                
+                element_index += 1
+
+        # Title fallback: PDF metadata → first H1 heading → filename
+        raw_title = (doc.metadata.get("title") or "").strip()
+        ANON_VALUES = {"", "(anonymous)", "untitled", "unknown"}
+        if raw_title.lower() not in ANON_VALUES:
+            resolved_title = raw_title
+        else:
+            first_h1 = next(
+                (e.text.split('\n')[0][:120] for e in elements
+                 if getattr(e, 'type', '') == 'heading' and getattr(e, 'level', 0) == 1),
+                None
+            )
+            resolved_title = first_h1 or source_item.original_filename
+
+        doc_metadata = DocumentMetadata(
+            title=resolved_title,
+            author=doc.metadata.get("author") or "",
+            created_at=doc.metadata.get("creationDate") or "",
+            modified_at=doc.metadata.get("modDate") or "",
+            source_type=source_item.source_type,
+            content_type=source_item.content_type,
+            file_name=source_item.original_filename,
+            file_path=str(source_item.raw_path)
+        )
+        
+        return ExtractedDocument(
+            source_item=source_item,
+            raw_text="\n\n".join(full_text_blocks),
+            metadata=doc_metadata,
+            elements=elements,
+            parser_metadata={"page_count": len(doc)}
+        )
